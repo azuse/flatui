@@ -16,8 +16,8 @@
 
 namespace flatui {
 
-#define FLATUI_VERSION_MAJOR 0
-#define FLATUI_VERSION_MINOR 9
+#define FLATUI_VERSION_MAJOR 1
+#define FLATUI_VERSION_MINOR 0
 #define FLATUI_VERSION_REVISION 0
 
 // Turn X into a string literal.
@@ -37,9 +37,8 @@ namespace flatui {
 ///
 static const FlatUiVersion kVersion = {
     FLATUI_VERSION_MAJOR, FLATUI_VERSION_MINOR, FLATUI_VERSION_REVISION,
-    "FlatUi Library " FLATUI_STRING(FLATUI_VERSION_MAJOR) "."
-    FLATUI_STRING(FLATUI_VERSION_MINOR) "."
-    FLATUI_STRING(FLATUI_VERSION_REVISION)};
+    "FlatUi Library " FLATUI_STRING(FLATUI_VERSION_MAJOR) "." FLATUI_STRING(
+        FLATUI_VERSION_MINOR) "." FLATUI_STRING(FLATUI_VERSION_REVISION)};
 
 const FlatUiVersion& Version() { return kVersion; }
 

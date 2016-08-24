@@ -15,8 +15,12 @@
 #include <cstring>
 #include "flatui/flatui.h"
 #include "flatui/internal/flatui_util.h"
+#include "flatui/internal/flatui_layout.h"
+#include "flatui/internal/hb_complex_font.h"
 #include "flatui/internal/micro_edit.h"
 #include "fplbase/utilities.h"
+#include "motive/engine.h"
+#include "motive/init.h"
 
 using fplbase::Button;
 using fplbase::InputSystem;
@@ -25,14 +29,21 @@ using fplbase::LogInfo;
 using fplbase::Mesh;
 using fplbase::Shader;
 using fplbase::Texture;
-using mathfu::vec2;
-using mathfu::vec2i;
-using mathfu::vec3;
-using mathfu::vec3i;
-using mathfu::vec4;
-using mathfu::vec4i;
 
 namespace flatui {
+
+// Enum indicating a type of shaders used during font rendering.
+enum FontShaderType {
+  kFontShaderTypeDefault = 0,
+  kFontShaderTypeSdf,
+  kFontShaderTypeColor,
+  kFontShaderTypeCount,
+};
+
+struct Anim {
+  bool called_last_frame;
+  motive::Motivator motivator;
+};
 
 Direction GetDirection(Layout layout) {
   return static_cast<Direction>(layout & ~(kDirHorizontal - 1));
@@ -53,48 +64,6 @@ static const vec2i kDragStartPoisitionInvalid = vec2i(-1, -1);
 static const uint32_t kDefaultGroupHashedId = HashId(kDefaultGroupID);
 #endif
 
-// This holds the transient state of a group while its layout is being
-// calculated / rendered.
-class Group {
- public:
-  Group(Direction _direction, Alignment _align, int _spacing,
-        size_t _element_idx)
-      : direction_(_direction),
-        align_(_align),
-        spacing_(_spacing),
-        size_(mathfu::kZeros2i),
-        position_(mathfu::kZeros2i),
-        element_idx_(_element_idx),
-        margin_(mathfu::kZeros4i) {}
-
-  // Extend this group with the size of a new element, and possibly spacing
-  // if it wasn't the first element.
-  void Extend(const vec2i &extension) {
-    switch (direction_) {
-      case kDirHorizontal:
-        size_ = vec2i(size_.x() + extension.x() + (size_.x() ? spacing_ : 0),
-                      std::max(size_.y(), extension.y()));
-        break;
-      case kDirVertical:
-        size_ = vec2i(std::max(size_.x(), extension.x()),
-                      size_.y() + extension.y() + (size_.y() ? spacing_ : 0));
-        break;
-      case kDirOverlay:
-        size_ = vec2i(std::max(size_.x(), extension.x()),
-                      std::max(size_.y(), extension.y()));
-        break;
-    }
-  }
-
-  Direction direction_;
-  Alignment align_;
-  int spacing_;
-  vec2i size_;
-  vec2i position_;
-  size_t element_idx_;
-  vec4i margin_;
-};
-
 // This holds transient state used while a GUI is being laid out / rendered.
 // It is intentionally hidden from the interface.
 // It is implemented as a singleton that the GUI element functions can access.
@@ -102,36 +71,27 @@ class Group {
 class InternalState;
 InternalState *state = nullptr;
 
-class InternalState : public Group {
+class InternalState : public LayoutManager {
  public:
-  // We create one of these per GUI element, so new fields should only be
-  // added when absolutely necessary.
-  struct Element {
-    Element(const vec2i &_size, HashedId _hash)
-        : size(_size),
-          extra_size(mathfu::kZeros2i),
-          hash(_hash),
-          interactive(false) {}
-    vec2i size;        // Minimum on-screen size computed by layout pass.
-    vec2i extra_size;  // Additional size in a scrolling area (TODO: remove?)
-    HashedId hash;     // From id specified by the user.
-    bool interactive;  // Wants to respond to user input.
-  };
-
   InternalState(fplbase::AssetManager &assetman, FontManager &fontman,
-                fplbase::InputSystem &input)
-      : Group(kDirVertical, kAlignLeft, 0, 0),
-        layout_pass_(true),
-        canvas_size_(assetman.renderer().window_size()),
+                fplbase::InputSystem &input,
+                motive::MotiveEngine *motive_engine)
+      : LayoutManager(assetman.renderer().window_size()),
         default_projection_(true),
-        virtual_resolution_(FLATUI_DEFAULT_VIRTUAL_RESOLUTION),
+        depth_test_(false),
         matman_(assetman),
         renderer_(assetman.renderer()),
         input_(input),
         fontman_(fontman),
+        motive_engine_(motive_engine),
         clip_position_(mathfu::kZeros2i),
         clip_size_(mathfu::kZeros2i),
         clip_inside_(false),
+        text_outer_color_size_(0.0f),
+        text_line_height_scale_(kLineHeightDefault),
+        text_kerning_scale_(kKerningScaleDefault),
+        glyph_flags_(kGlyphFlagsNone),
+        sdf_threshold_(kSDFThresholdDefault),
         pointer_max_active_index_(kPointerIndexInvalid),
         gamepad_has_focus_element(false),
         default_focus_element_(kElementIndexInvalid),
@@ -139,8 +99,6 @@ class InternalState : public Group {
         latest_event_(kEventNone),
         latest_event_element_idx_(0),
         version_(&Version()) {
-    SetScale();
-
     bool flush_pointer_capture = true;
     // Cache the state of multiple pointers, so we have to do less work per
     // interactive element.
@@ -155,6 +113,11 @@ class InternalState : public Group {
         pointer_max_active_index_ = std::max(pointer_max_active_index_, i);
         flush_pointer_capture = false;
       }
+    }
+
+    for (int i = 0; i <= pointer_max_active_index_; i++) {
+      pointer_pos_[i] = input_.get_pointers()[i].mousepos;
+      pointer_delta_[i] = input_.get_pointers()[i].mousedelta;
     }
 
     // If no pointer is active, flush the pointer capture status.
@@ -174,12 +137,21 @@ class InternalState : public Group {
     // Load shaders ahead.
     image_shader_ = matman_.LoadShader("shaders/textured");
     assert(image_shader_);
-    font_shader_ = matman_.LoadShader("shaders/font");
-    assert(font_shader_);
-    font_clipping_shader_ = matman_.LoadShader("shaders/font_clipping");
-    assert(font_clipping_shader_);
     color_shader_ = matman_.LoadShader("shaders/color");
     assert(color_shader_);
+
+    font_shaders_[kFontShaderTypeDefault][0]
+        .set(matman_.LoadShader("shaders/font"));
+    font_shaders_[kFontShaderTypeDefault][1]
+        .set(matman_.LoadShader("shaders/font_clipping"));
+    font_shaders_[kFontShaderTypeSdf][0]
+        .set(matman_.LoadShader("shaders/font_sdf"));
+    font_shaders_[kFontShaderTypeSdf][1]
+        .set(matman_.LoadShader("shaders/font_clipping_sdf"));
+    font_shaders_[kFontShaderTypeColor][0]
+        .set(matman_.LoadShader("shaders/font_color"));
+    font_shaders_[kFontShaderTypeColor][1]
+        .set(matman_.LoadShader("shaders/font_clipping_color"));
 
     text_color_ = mathfu::kOnes4f;
 
@@ -191,28 +163,14 @@ class InternalState : public Group {
     current_pointer_ = kPointerIndexInvalid;
 
     fontman_.StartLayoutPass();
+
+    if (!persistent_.initialized) {
+      motive::SplineInit::Register();
+      persistent_.initialized = true;
+    }
   }
 
   ~InternalState() { state = nullptr; }
-
-  template <int D>
-  mathfu::Vector<int, D> VirtualToPhysical(const mathfu::Vector<float, D> &v) {
-    return mathfu::Vector<int, D>(v * pixel_scale_ + 0.5f);
-  }
-
-  template <int D>
-  mathfu::Vector<float, D> PhysicalToVirtual(const mathfu::Vector<int, D> &v) {
-    return mathfu::Vector<float, D>(v) / pixel_scale_;
-  }
-
-  // Initialize the scaling factor for the virtual resolution.
-  void SetScale() {
-    auto scale = vec2(canvas_size_) / virtual_resolution_;
-    pixel_scale_ = std::min(scale.x(), scale.y());
-  }
-
-  // Retrieve the scaling factor for the virtual resolution.
-  float GetScale() { return pixel_scale_; }
 
   // Override the use of a default projection matrix and canvas size.
   void UseExistingProjection(const vec2i &canvas_size) {
@@ -220,138 +178,54 @@ class InternalState : public Group {
     default_projection_ = false;
   }
 
+  void ApplyCustomTransform(const mat4 &imvp) {
+    if (layout_pass_) {
+      for (int i = 0; i <= pointer_max_active_index_; i++) {
+        auto clip_pos =
+            vec2(pointer_pos_[i]) / vec2(renderer_.window_size()) * 2 - 1;
+        clip_pos.y() *= -1;  // Mouse coords are LH, clip space is RH.
+        // Get two 3d positions at the pointer position to form a ray
+        auto obj_pos1 = imvp * vec4(vec2(clip_pos), vec2(-0.5f, 1.0f));
+        auto obj_pos2 = imvp * vec4(vec2(clip_pos), vec2(0.5f, 1.0f));
+        // (inverse) perspective divide.
+        obj_pos1 /= obj_pos1.w();
+        obj_pos2 /= obj_pos2.w();
+        auto ray = obj_pos2 - obj_pos1;
+        // Find where the ray intersects object-space plane Z=0.
+        auto t = (0.0f - obj_pos1.z()) / ray.z();
+        auto on_plane = t * ray.xy() + obj_pos1.xy();
+        pointer_pos_[i] = vec2i(on_plane + 0.5f);
+        // Back into LH UI pixels.
+        pointer_pos_[i].y() = canvas_size_.y() - pointer_pos_[i].y();
+        // TODO(wvo): transform delta relative to current pointer_pos_ ?
+      }
+    }
+  }
+
+  void SetDepthTest(bool enable) { depth_test_ = enable; }
+
   // Set up an ortho camera for all 2D elements, with (0, 0) in the top left,
   // and the bottom right the windows size in pixels.
   // This is currently hardcoded to use overlay on top of the entire GL window.
   // If that ever changes, we also need to change our use of glScissor below.
   void SetOrtho() {
-    auto ortho_mat = mathfu::OrthoHelper<float>(
+    auto ortho_mat = mathfu::mat4::Ortho(
         0.0f, static_cast<float>(canvas_size_.x()),
         static_cast<float>(canvas_size_.y()), 0.0f, -1.0f, 1.0f);
     renderer_.set_model_view_projection(ortho_mat);
   }
 
-  // Compute a space offset for a particular alignment for just the x or y
-  // dimension.
-  static vec2i AlignDimension(Alignment align, int dim, const vec2i &space) {
-    vec2i dest(0, 0);
-    switch (align) {
-      case kAlignTop:  // Same as kAlignLeft.
-        break;
-      case kAlignCenter:
-        dest[dim] += space[dim] / 2;
-        break;
-      case kAlignBottom:  // Same as kAlignRight.
-        dest[dim] += space[dim];
-        break;
-    }
-    return dest;
-  }
-
-  void SetVirtualResolution(float virtual_resolution) {
-    if (layout_pass_) {
-      virtual_resolution_ = virtual_resolution;
-      SetScale();
-    }
-  }
-
-  vec2 GetVirtualResolution() { return vec2(canvas_size_) / pixel_scale_; }
-
-  // Determines placement for the UI as a whole inside the available space
-  // (screen).
-  void PositionGroup(Alignment horizontal, Alignment vertical,
-                     const vec2 &offset) {
-    if (!layout_pass_) {
-      auto space = canvas_size_ - size_;
-      position_ = AlignDimension(horizontal, 0, space) +
-                  AlignDimension(vertical, 1, space) +
-                  VirtualToPhysical(offset);
-    }
-  }
-
   // Switch from the layout pass to the render pass.
   void StartRenderPass() {
-    // If you hit this assert, you are missing an EndGroup().
-    assert(!group_stack_.size());
-
     // Do nothing if there is no elements.
-    if (elements_.size() == 0) return;
-
-    // Put in a sentinel element. We'll use this element to point to
-    // when a group didn't exist during layout but it does during rendering.
-    NewElement(mathfu::kZeros2i, kNullHash);
+    if (!StartSecondPass()) return;
 
     // Update font manager if they need to upload font atlas texture.
     fontman_.StartRenderPass();
 
-    position_ = mathfu::kZeros2i;
-    size_ = elements_[0].size;
-
-    layout_pass_ = false;
-    element_it_ = elements_.begin();
-
     CheckGamePadNavigation();
 
     if (default_projection_) SetOrtho();
-  }
-
-  // (render pass): retrieve the next corresponding cached element we
-  // created in the layout pass. This is slightly more tricky than a straight
-  // lookup because event handlers may insert/remove elements.
-  Element *NextElement(HashedId hash) {
-    auto backup = element_it_;
-    while (element_it_ != elements_.end()) {
-      // This loop usually returns on the first iteration, the only time it
-      // doesn't is if an event handler caused an element to removed.
-      auto &element = *element_it_;
-      ++element_it_;
-      if (EqualId(element.hash, hash)) return &element;
-    }
-    // Didn't find this id at all, which means an event handler just caused
-    // this element to be added, so we skip it.
-    element_it_ = backup;
-    return nullptr;
-  }
-
-  // (layout pass): create a new element.
-  void NewElement(const vec2i &size, HashedId hash) {
-    elements_.push_back(Element(size, hash));
-  }
-
-  // (render pass): move the group's current position past an element of
-  // the given size.
-  void Advance(const vec2i &size) {
-    switch (direction_) {
-      case kDirHorizontal:
-        position_ += vec2i(size.x() + spacing_, 0);
-        break;
-      case kDirVertical:
-        position_ += vec2i(0, size.y() + spacing_);
-        break;
-      case kDirOverlay:
-        // Keep at starting position.
-        break;
-    }
-  }
-
-  // (render pass): return the position of the current element, as a function
-  // of the group's current position and the alignment.
-  vec2i Position(const Element &element) {
-    auto pos = position_ + margin_.xy();
-    auto space = size_ - element.size - margin_.xy() - margin_.zw();
-    switch (direction_) {
-      case kDirHorizontal:
-        pos += AlignDimension(align_, 1, space);
-        break;
-      case kDirVertical:
-        pos += AlignDimension(align_, 0, space);
-        break;
-      case kDirOverlay:
-        pos += AlignDimension(align_, 0, space);
-        pos += AlignDimension(align_, 1, space);
-        break;
-    }
-    return pos;
   }
 
   void RenderQuad(Shader *sh, const vec4 &color, const vec2i &pos,
@@ -390,15 +264,16 @@ class InternalState : public Group {
     }
   }
 
-  bool Edit(float ysize, const mathfu::vec2 &edit_size, const char *id,
-            std::string *text) {
+  Event Edit(float ysize, const mathfu::vec2 &edit_size,
+             TextAlignment alignment, const char *id, EditStatus *status,
+             std::string *text) {
     auto hash = HashId(id);
     StartGroup(GetDirection(kLayoutHorizontalBottom),
                GetAlignment(kLayoutHorizontalBottom), 0, hash);
-    bool in_edit = false;
+    EditStatus edit_status = kEditStatusNone;
     if (EqualId(persistent_.input_focus_, hash)) {
       // The widget is in edit.
-      in_edit = true;
+      edit_status = kEditStatusInEdit;
     }
 
     // Check event, this marks this element as an interactive element.
@@ -416,13 +291,15 @@ class InternalState : public Group {
       physical_label_size.y() = size.y();
       edit_mode = kSingleLine;
     }
-    if (in_edit && persistent_.text_edit_.GetEditingText()) {
+    if (edit_status && persistent_.text_edit_.GetEditingText()) {
       // Get a text from the micro editor when it's editing.
       ui_text = persistent_.text_edit_.GetEditingText();
     }
     auto parameter = FontBufferParameters(
-        fontman_.GetCurrentFace()->font_id_, HashId(ui_text->c_str()),
-        static_cast<float>(size.y()), physical_label_size, true);
+        fontman_.GetCurrentFont()->GetFontId(), HashId(ui_text->c_str()),
+        static_cast<float>(size.y()), physical_label_size, alignment,
+        glyph_flags_, edit_status == kEditStatusInEdit, false,
+        text_kerning_scale_, text_line_height_scale_);
     auto buffer =
         fontman_.GetBuffer(ui_text->c_str(), ui_text->length(), parameter);
     assert(buffer);
@@ -437,12 +314,11 @@ class InternalState : public Group {
     persistent_.text_edit_.SetWindowSize(physical_label_size);
 
     auto window = vec4i(vec2i(0, 0), physical_label_size);
-    if (in_edit) {
+    if (edit_status) {
       window = persistent_.text_edit_.GetWindow();
     }
     auto pos = Label(*buffer, parameter, window);
     if (!layout_pass_) {
-      auto show_caret = false;
       bool pick_caret = (event & kEventWentDown) != 0;
       if (EqualId(persistent_.input_focus_, hash)) {
         // The edit box is in focus. Now we can start text input.
@@ -450,11 +326,14 @@ class InternalState : public Group {
           // Initialize the editor.
           persistent_.text_edit_.Initialize(text, edit_mode);
           persistent_.text_edit_.SetLanguage(fontman_.GetLanguage());
+          persistent_.text_edit_.SetDirection(fontman_.GetLayoutDirection());
           persistent_.text_edit_.SetBuffer(buffer);
           pick_caret = true;
           CaptureInput(hash, true);
         }
-        show_caret = true;
+        edit_status = kEditStatusInEdit;
+      } else {
+        edit_status = kEditStatusNone;
       }
       if (pick_caret) {
         auto caret_pos =
@@ -469,7 +348,7 @@ class InternalState : public Group {
               &focus_region_length)) {
         // IME is active in the editor.
         // Show some input region indicators.
-        if (show_caret && input_region_length) {
+        if (edit_status && input_region_length) {
           const float kInputLineWidth = 1.0f;
           const float kFocusLineWidth = 3.0f;
 
@@ -503,16 +382,15 @@ class InternalState : public Group {
         }
       }
 
-      if (show_caret) {
+      if (edit_status) {
         // Render caret.
         const float kCaretPositionSizeFactor = 0.8f;
-        const float kCaretWidth = 2.0f;
+        const float kCaretWidth = 4.0f;
         auto caret_pos =
             buffer->GetCaretPosition(persistent_.text_edit_.GetCaretPosition());
-
         auto caret_height = size.y() * kCaretPositionSizeFactor;
-        if (caret_pos.x() >= window.x() &&
-            caret_pos.x() <= window.x() + window.z() &&
+        if (caret_pos.x() >= window.x() - kCaretWidth &&
+            caret_pos.x() <= window.x() + window.z() + kCaretWidth &&
             caret_pos.y() >= window.y() &&
             caret_pos.y() - caret_height <= window.y() + window.w()) {
           caret_pos += pos;
@@ -525,16 +403,20 @@ class InternalState : public Group {
 
         // Handle text input events only after the rendering for the pass is
         // finished.
-        auto finished_input = persistent_.text_edit_.HandleInputEvents(
+        edit_status = persistent_.text_edit_.HandleInputEvents(
             input_.GetTextInputEvents());
         input_.ClearTextInputEvents();
-        if (finished_input) {
+        if (edit_status == kEditStatusFinished ||
+            edit_status == kEditStatusCanceled) {
           CaptureInput(kNullHash, true);
         }
       }
     }
     EndGroup();
-    return in_edit;
+    if (status) {
+      *status = edit_status;
+    }
+    return event;
   }
 
   // Helper for Edit widget to draw an underline.
@@ -564,25 +446,77 @@ class InternalState : public Group {
     }
   }
 
-  // Text label.
-  void Label(const char *text, float ysize) {
-    auto size = vec2(0, ysize);
-    Label(text, ysize, size);
-  }
-
-  // Multi line Text label.
-  void Label(const char *text, float ysize, const vec2 &label_size) {
+  void Label(const char *text, float ysize, const vec2 &label_size,
+             TextAlignment alignment) {
     // Set text color.
     renderer_.set_color(text_color_);
 
     auto physical_label_size = VirtualToPhysical(label_size);
     auto size = VirtualToPhysical(vec2(0, ysize));
     auto parameter = FontBufferParameters(
-        fontman_.GetCurrentFace()->font_id_, HashId(text),
-        static_cast<float>(size.y()), physical_label_size, false);
+        fontman_.GetCurrentFont()->GetFontId(), HashId(text),
+        static_cast<float>(size.y()), physical_label_size, alignment,
+        glyph_flags_, false, false, text_kerning_scale_,
+        text_line_height_scale_);
     auto buffer = fontman_.GetBuffer(text, strlen(text), parameter);
     assert(buffer);
     Label(*buffer, parameter, vec4i(vec2i(0, 0), buffer->get_size()));
+  }
+
+  void DrawFontBuffer(const FontBuffer &buffer, const vec2 &pos,
+                      const mathfu::vec4 &clip_rect, bool use_sdf,
+                      bool render_outer_color) {
+    auto slices = buffer.get_slices();
+    auto current_format = fplbase::kFormatAuto;
+    bool clipping = clip_rect.z() != 0.0f && clip_rect.w() != 0.0f;
+
+    for (size_t i = 0; i < slices->size(); ++i) {
+      auto texture = fontman_.GetAtlasTexture(slices->at(i));
+      texture->Set(0);
+
+      if (current_format != texture->format()) {
+        current_format = texture->format();
+
+        // Switch shaders based on drawing conditions.
+        FontShaderType shader_type =
+            current_format == fplbase::kFormat8888
+                ? kFontShaderTypeColor
+                : use_sdf ? kFontShaderTypeSdf : kFontShaderTypeDefault;
+
+        // Color glyph doesn't support outer_color.
+        if (shader_type == kFontShaderTypeColor && render_outer_color) continue;
+
+        auto current_shader = &font_shaders_[shader_type][clipping ? 1 : 0];
+        current_shader->set_renderer(renderer_);
+
+        // Set shader specific parameters.
+        auto *color = &text_color_;
+        current_shader->set_position_offset(vec3(pos, 0.0f));
+        if (use_sdf) {
+          if (render_outer_color) {
+            color = &text_outer_color_;
+            current_shader->set_threshold(text_outer_color_size_);
+          } else {
+            current_shader->set_threshold(sdf_threshold_);
+          }
+        }
+        if (clipping) {
+          current_shader->set_clipping(clip_rect);
+        }
+        if (current_shader->color_handle() >= 0) {
+          current_shader->set_color(*color);
+        }
+      }
+
+      const fplbase::Attribute kFormat[] = {
+          fplbase::kPosition3f, fplbase::kTexCoord2f, fplbase::kEND};
+      auto indices = buffer.get_indices(static_cast<int32_t>(i));
+      Mesh::RenderArray(
+          Mesh::kTriangles, static_cast<int>(indices->size()), kFormat,
+          sizeof(FontVertex),
+          reinterpret_cast<const char *>(buffer.get_vertices()->data()),
+          indices->data());
+    }
   }
 
   vec2i Label(const FontBuffer &buffer, const FontBufferParameters &parameter,
@@ -601,8 +535,6 @@ class InternalState : public Group {
 
       auto element = NextElement(hash);
       if (element) {
-        fontman_.GetAtlasTexture()->Set(0);
-
         pos = Position(*element);
 
         bool clipping = false;
@@ -611,53 +543,46 @@ class InternalState : public Group {
                      (buffer.get_size().x() > window.z()) ||
                      (buffer.get_size().y() > window.w());
         }
+
         if (clipping) {
+          // Font rendering with a clipping.
           pos -= window.xy();
 
           // Set a window to show a part of the label.
-          font_clipping_shader_->Set(renderer_);
-          font_clipping_shader_->SetUniform(
-              "pos_offset", vec3(static_cast<float>(pos.x()),
-                                 static_cast<float>(pos.y()), 0.0f));
           auto start = vec2(position_ - pos);
           auto end = start + vec2(window.zw());
-          font_clipping_shader_->SetUniform("clipping", vec4(start, end));
-        } else {
-          font_shader_->Set(renderer_);
-          font_shader_->SetUniform("pos_offset",
-                                   vec3(static_cast<float>(pos.x()),
-                                        static_cast<float>(pos.y()), 0.0f));
-        }
+          start.y() -= buffer.metrics().internal_leading();
+          end.y() -= buffer.metrics().external_leading();
 
-        const fplbase::Attribute kFormat[] = {
-            fplbase::kPosition3f, fplbase::kTexCoord2f, fplbase::kEND};
-        Mesh::RenderArray(
-            Mesh::kTriangles, static_cast<int>(buffer.get_indices()->size()),
-            kFormat, sizeof(FontVertex),
-            reinterpret_cast<const char *>(buffer.get_vertices()->data()),
-            buffer.get_indices()->data());
+          if (parameter.get_glyph_flags() &
+              (kGlyphFlagsInnerSDF | kGlyphFlagsOuterSDF)) {
+            if (text_outer_color_size_ != 0.0f) {
+              // Render shadow.
+              DrawFontBuffer(buffer, vec2(pos) + text_outer_color_offset,
+                             vec4(start, end), true, true);
+            }
+            DrawFontBuffer(buffer, vec2(pos), vec4(start, end), true, false);
+          } else {
+            DrawFontBuffer(buffer, vec2(pos), vec4(start, end), false, false);
+          }
+        } else {
+          // Regular font rendering.
+          if (parameter.get_glyph_flags() &
+              (kGlyphFlagsInnerSDF | kGlyphFlagsOuterSDF)) {
+            if (text_outer_color_size_ != 0.0f) {
+              // Render shadow.
+              DrawFontBuffer(buffer, vec2(pos) + text_outer_color_offset,
+                             mathfu::kZeros4f, true, true);
+            }
+            DrawFontBuffer(buffer, vec2(pos), mathfu::kZeros4f, true, false);
+          } else {
+            DrawFontBuffer(buffer, vec2(pos), mathfu::kZeros4f, false, false);
+          }
+        }
         Advance(element->size);
       }
     }
     return pos;
-  }
-
-  // Custom element with user supplied renderer.
-  void CustomElement(
-      const vec2 &virtual_size, const char *id,
-      const std::function<void(const vec2i &pos, const vec2i &size)> renderer) {
-    auto hash = HashId(id);
-    if (layout_pass_) {
-      auto size = VirtualToPhysical(virtual_size);
-      NewElement(size, hash);
-      Extend(size);
-    } else {
-      auto element = NextElement(hash);
-      if (element) {
-        renderer(Position(*element), element->size);
-        Advance(element->size);
-      }
-    }
   }
 
   // Render texture on the screen.
@@ -686,63 +611,12 @@ class InternalState : public Group {
     }
   }
 
-  // An element that has sub-elements. Tracks its state in an instance of
-  // Layout, that is pushed/popped from the stack as needed.
-  void StartGroup(Direction direction, Alignment align, float spacing,
-                  HashedId hash) {
-    Group layout(direction, align, static_cast<int>(spacing), elements_.size());
-    group_stack_.push_back(*this);
-    if (layout_pass_) {
-      NewElement(mathfu::kZeros2i, hash);
-    } else {
-      auto element = NextElement(hash);
-      if (element) {
-        layout.position_ = Position(*element);
-        layout.size_ = element->size;
-        // Make layout refer to element it originates from, iterator points
-        // to next element after the current one.
-        layout.element_idx_ = element_it_ - elements_.begin() - 1;
-      } else {
-        // This group did not exist during layout, but since all code inside
-        // this group will run, it is important to have a valid element_idx_
-        // to refer to, so we point it to our (empty) sentinel element:
-        layout.element_idx_ = elements_.size() - 1;
-      }
-    }
-    *static_cast<Group *>(this) = layout;
-  }
-
-  // Clean up the Group element started by StartGroup()
-  void EndGroup() {
-    // If you hit this assert, you have one too many EndGroup().
-    assert(group_stack_.size());
-
-    auto size = size_;
-    auto margin = margin_.xy() + margin_.zw();
-    auto element_idx = element_idx_;
-    *static_cast<Group *>(this) = group_stack_.back();
-    group_stack_.pop_back();
-    if (layout_pass_) {
-      size += margin;
-      // Contribute the size of this group to its parent.
-      Extend(size);
-      // Set the size of this group as the size of the element tracking it.
-      elements_[element_idx].size = size;
-    } else {
-      Advance(elements_[element_idx].size);
-    }
-  }
-
   void ModalGroup() {
     if (group_stack_.back().direction_ == kDirOverlay) {
       // Simply mark all elements before this last group as non-interactive.
       for (size_t i = 0; i < element_idx_; i++)
         elements_[i].interactive = false;
     }
-  }
-
-  void SetMargin(const Margin &margin) {
-    margin_ = VirtualToPhysical(margin.borders);
   }
 
   void StartScroll(const vec2 &size, vec2 *virtual_offset) {
@@ -792,11 +666,10 @@ class InternalState : public Group {
           // Finish dragging and release the pointer.
           ReleasePointer();
         }
-        pointer_delta = input_.get_pointers()[0].mousedelta;
+        pointer_delta = pointer_delta_[0];
       } else {
         // Wheel scroll
-        if (mathfu::InRange2D(input_.get_pointers()[0].mousepos, position_,
-                              position_ + psize)) {
+        if (mathfu::InRange2D(pointer_pos_[0], position_, position_ + psize)) {
           pointer_delta = input_.mousewheel_delta();
           scroll_speed = static_cast<int32_t>(-scroll_speed_wheel_);
         }
@@ -834,8 +707,7 @@ class InternalState : public Group {
       // See if the mouse is outside the clip area, so we can avoid events
       // being triggered by elements that are not visible.
       for (int i = 0; i <= pointer_max_active_index_; i++) {
-        if (!mathfu::InRange2D(input_.get_pointers()[i].mousepos, position_,
-                               position_ + psize)) {
+        if (!mathfu::InRange2D(pointer_pos_[i], position_, position_ + psize)) {
           clip_mouse_inside_[i] = false;
         }
       }
@@ -923,6 +795,78 @@ class InternalState : public Group {
 
   void EndSlider() {}
 
+  // The hashmap stores the internal animation state for the API
+  // call to `Animatable(id)`. To conserve memory space, the
+  // internal state for `id` will be removed if `Animatable(id)`
+  // was not called in the previous frame.
+  void Clean() {
+    for (auto it = persistent_.animations.begin();
+         it != persistent_.animations.end();) {
+      if (it->second.called_last_frame) {
+        it->second.called_last_frame = false;
+        ++it;
+      } else {
+        it = persistent_.animations.erase(it);
+      }
+    }
+  }
+
+  // Return the internal animation state for the API call to
+  // `Animatable(id)`. This state persists from frame to
+  // frame as long as `Animatable(id)` is called every frame.
+  // If no state currently exists for `id` because
+  // `Animatable(id)` was not called the previous frame,
+  // return nullptr.
+  static Anim *FindAnim(const std::string &id) {
+    auto it = persistent_.animations.find(id);
+    return it != persistent_.animations.end() ? &(it->second) : nullptr;
+  }
+
+  // Initialize an array of Motive Targets with the values of targets.
+  static void CreateMotiveTargets(const float *values, int dimensions,
+                                  motive::MotiveTime target_time,
+                                  motive::MotiveTarget1f *targets) {
+    for (int i = 0; i < dimensions; ++i) {
+      targets[i] = motive::MotiveTarget1f(
+          motive::MotiveNode1f(values[i], 0, target_time));
+    }
+  }
+
+  // Create a new Motivator if it isn't found in our hashmap and initialize it
+  // with starting values. Return the current value of the motivator.
+  const float *Animatable(const std::string id, const float *starting_values,
+                          int dimensions) {
+    assert(motive_engine_);
+    Anim *current = FindAnim(id);
+    if (!current) {
+      motive::MotiveTarget1f targets[kMaxDimensions];
+      CreateMotiveTargets(starting_values, dimensions, 0, targets);
+      motive::MotivatorNf motivator(motive::SplineInit(), motive_engine_,
+                                    dimensions, targets);
+      Anim animation;
+      animation.motivator = motivator;
+      current = &(persistent_.animations[id] = animation);
+    }
+    current->called_last_frame = true;
+    return reinterpret_cast<motive::MotivatorNf *>(&current->motivator)
+        ->Values();
+  }
+
+  // Set the target value to which the motivator animates.
+  void StartAnimation(const std::string id, double target_time,
+                      const float *target_values, int dimensions) {
+    Anim *current = FindAnim(id);
+    if (current) {
+      const motive::MotiveTime motive_target_time =
+          static_cast<motive::MotiveTime>(target_time * kSecondsToMotiveTime);
+      motive::MotiveTarget1f targets[kMaxDimensions];
+      CreateMotiveTargets(target_values, dimensions, motive_target_time,
+                          targets);
+      reinterpret_cast<motive::MotivatorNf *>(&current->motivator)
+          ->SetTargets(targets);
+    }
+  }
+
   // Set scroll speed of the scroll group.
   // scroll_speed_drag: Scroll speed with a pointer drag operation.
   // scroll_speed_wheel: Scroll speed with a mouse wheel operation.
@@ -998,13 +942,16 @@ class InternalState : public Group {
     return EqualId(persistent_.mouse_capture_, hash);
   }
 
-  vec2i GroupPosition() { return position_; }
-
-  vec2i GroupSize() { return size_ + elements_[element_idx_].extra_size; }
-
   void RecordId(HashedId hash, int i) { persistent_.pointer_element[i] = hash; }
   bool SameId(HashedId hash, int i) {
     return EqualId(hash, persistent_.pointer_element[i]);
+  }
+
+  Event FireEvent(size_t element_idx, Event e) {
+    latest_event_ = e;
+    latest_event_element_idx_ = element_idx;
+    if (global_listener_) global_listener_(elements_[element_idx].hash, e);
+    return e;
   }
 
   Event CheckEvent(bool check_dragevent_only) {
@@ -1032,7 +979,7 @@ class InternalState : public Group {
         // pointer_max_active_index_ is typically 0, so loop not expensive.
         for (int i = 0; i <= pointer_max_active_index_; i++) {
           if ((CanReceivePointerEvent(hash) && clip_mouse_inside_[i] &&
-               mathfu::InRange2D(input_.get_pointers()[i].mousepos, position_,
+               mathfu::InRange2D(pointer_pos_[i], position_,
                                  position_ + size_)) ||
               IsPointerCaptured(hash)) {
             auto &button = *pointer_buttons_[i];
@@ -1080,14 +1027,13 @@ class InternalState : public Group {
 
               // Check for drag events.
               if (button.went_down()) {
-                persistent_.drag_start_position_ =
-                    input_.get_pointers()[i].mousepos;
+                persistent_.drag_start_position_ = pointer_pos_[i];
               }
               if (button.is_down() &&
                   mathfu::InRange2D(persistent_.drag_start_position_, position_,
                                     position_ + size_) &&
                   !mathfu::InRange2D(
-                       input_.get_pointers()[i].mousepos,
+                       pointer_pos_[i],
                        persistent_.drag_start_position_ - drag_start_threshold_,
                        persistent_.drag_start_position_ +
                            drag_start_threshold_)) {
@@ -1096,8 +1042,7 @@ class InternalState : public Group {
                 // event, so that parent layer can start a dragging operation
                 // regardless if it's sub-layer is checking event.
                 event |= kEventStartDrag;
-                persistent_.drag_start_position_ =
-                    input_.get_pointers()[i].mousepos;
+                persistent_.drag_start_position_ = pointer_pos_[i];
                 persistent_.dragging_pointer_ = i;
               }
             }
@@ -1111,19 +1056,15 @@ class InternalState : public Group {
             // We only report an event for the first finger to touch an element.
             // This is intentional.
 
-            latest_event_ = static_cast<Event>(event);
-            latest_event_element_idx_ = element_idx_;
-            return static_cast<Event>(event);
+            return FireEvent(element_idx_, static_cast<Event>(event));
           }
         }
-        // Generate hover events for the current element the gamepad/keyboard
+        // Generate events for the current element the gamepad/keyboard
         // is focused on, but only if the gamepad/keyboard is active.
         if (!persistent_.is_last_event_pointer_type &&
             EqualId(persistent_.input_focus_, hash)) {
           gamepad_has_focus_element = true;
-          latest_event_ = gamepad_event;
-          latest_event_element_idx_ = element_idx_;
-          return gamepad_event;
+          return FireEvent(element_idx_, gamepad_event);
         }
       }
     }
@@ -1139,8 +1080,10 @@ class InternalState : public Group {
   void SetDefaultFocus() {
     // Need to keep an index rather than the hash to check if the element is
     // an interactive element later.
-    default_focus_element_ = element_idx_;
+    default_focus_element_ = static_cast<int32_t>(element_idx_);
   }
+
+  bool depth_test() { return depth_test_; }
 
   void CheckGamePadFocus() {
     if (!gamepad_has_focus_element && persistent_.input_capture_ == kNullHash) {
@@ -1159,15 +1102,15 @@ class InternalState : public Group {
     // Update state.
     int dir = GetNavigationDirection();
 
-    // If "back" is pressed, clear the current focus.
-    if (BackPressed()) {
-      CaptureInput(kNullHash, true);
-    }
-
     // Gamepad/keyboard navigation only happens when the keyboard is not
     // captured.
     if (persistent_.input_capture_ != kNullHash) {
       return;
+    }
+
+    // If "back" is pressed, clear the current focus.
+    if (BackPressed()) {
+      CaptureInput(kNullHash, true);
     }
 
     // Now find the current element, and move to the next.
@@ -1244,19 +1187,12 @@ class InternalState : public Group {
 
   HashedId NextInteractiveElement(int start, int direction) {
     auto range = static_cast<int>(elements_.size());
-    for (auto i = start;;) {
-      i += direction;
-      // Wrap around.. just once.
-      if (i < 0)
-        i = range - 1;
-      else if (i >= range)
-        i = 0;
-      // Back where we started, either there's no interactive elements, or
-      // the vector is empty.
-      if (i == start) return kNullHash;
-
+    auto count = range;
+    for (auto i = start; count > 0; --count) {
+      i = (i + direction + range) % range;
       if (elements_[i].interactive) return elements_[i].hash;
     }
+    return kNullHash;
   }
 
   void ColorBackground(const vec4 &color) {
@@ -1276,37 +1212,77 @@ class InternalState : public Group {
     RenderTextureNinePatch(tex, patch_info, position_, GroupSize());
   }
 
+  // Enable/Disable SDF generation.
+  void EnableTextSDF(bool inner_sdf, bool outer_sdf, float threshold) {
+    glyph_flags_ = (inner_sdf ? kGlyphFlagsInnerSDF : kGlyphFlagsNone) |
+                   (outer_sdf ? kGlyphFlagsOuterSDF : kGlyphFlagsNone);
+    sdf_threshold_ = threshold;
+  }
+
+  void SetTextOuterColor(const mathfu::vec4 &color, float size,
+                         const mathfu::vec2 &offset) {
+    // Outer SDF need to be enabled to use the feature.
+    assert(glyph_flags_ | kGlyphFlagsOuterSDF);
+    text_outer_color_ = color;
+    text_outer_color_size_ = size;
+    text_outer_color_offset = offset;
+  }
+
   // Set Label's text color.
   void SetTextColor(const vec4 &color) { text_color_ = color; }
 
   // Set Label's font.
-  void SetTextFont(const char *font_name) { fontman_.SelectFont(font_name); }
+  bool SetTextFont(const char *font_name) {
+    return fontman_.SelectFont(font_name);
+  }
+  bool SetTextFont(const char *font_names[], int32_t count) {
+    return fontman_.SelectFont(font_names, count);
+  }
+
+  // Set a locale used for the text rendering.
+  void SetTextLocale(const char *locale) { fontman_.SetLocale(locale); }
+
+  // Override text layout direction that is set by SetTextLanguage() API.
+  void SetTextDirection(TextLayoutDirection direction) {
+    fontman_.SetLayoutDirection(direction);
+  }
+
+  // Set a line height scaling used in the text rendering.
+  void SetTextLineHeightScale(float scale) { text_line_height_scale_ = scale; }
+
+  // Set a kerning scaling used in the text rendering.
+  void SetTextKerningScale(float scale) { text_kerning_scale_ = scale; }
+
+  // Set ellipsis characters used in the text rendering.
+  void SetTextEllipsis(const char* ellipsis) {
+    fontman_.SetTextEllipsis(ellipsis);
+  }
+
+  void SetGlobalListener(
+      const std::function<void(HashedId id, Event event)> &callback) {
+    global_listener_ = callback;
+  }
 
   // Return the version of the FlatUI Library
   const FlatUiVersion *GetFlatUiVersion() const { return version_; }
 
  private:
-  vec2i GetPointerDelta() { return input_.get_pointers()[0].mousedelta; }
+  vec2i GetPointerDelta() { return pointer_delta_[0]; }
 
-  vec2i GetPointerPosition() { return input_.get_pointers()[0].mousepos; }
+  vec2i GetPointerPosition() { return pointer_pos_[0]; }
 
-  bool layout_pass_;
-  std::vector<Element> elements_;
-  std::vector<Element>::iterator element_it_;
-  std::vector<Group> group_stack_;
-  vec2i canvas_size_;
   bool default_projection_;
-  float virtual_resolution_;
-  float pixel_scale_;
+
+  bool depth_test_;
 
   fplbase::AssetManager &matman_;
   fplbase::Renderer &renderer_;
   InputSystem &input_;
   FontManager &fontman_;
   Shader *image_shader_;
-  Shader *font_shader_;
-  Shader *font_clipping_shader_;
   Shader *color_shader_;
+  FontShader font_shaders_[kFontShaderTypeCount][2];
+  motive::MotiveEngine *motive_engine_;
 
   // Expensive rendering commands can check if they're inside this rect to
   // cull themselves inside a scrolling group.
@@ -1317,9 +1293,24 @@ class InternalState : public Group {
 
   // Widget properties.
   mathfu::vec4 text_color_;
+  // Text's outer color setting
+  mathfu::vec4 text_outer_color_;
+  float text_outer_color_size_;
+  mathfu::vec2 text_outer_color_offset;
+
+  // Text metrices.
+  float text_line_height_scale_;
+  float text_kerning_scale_;
+
+  // Flags that indicates glyph generation parameters, such as SDF.
+  GlyphFlags glyph_flags_;
+  // Threshold value for SDF rendering.
+  float sdf_threshold_;
 
   int pointer_max_active_index_;
   const Button *pointer_buttons_[InputSystem::kMaxSimultanuousPointers];
+  vec2i pointer_pos_[InputSystem::kMaxSimultanuousPointers];
+  vec2i pointer_delta_[InputSystem::kMaxSimultanuousPointers];
   bool gamepad_has_focus_element;
   int32_t default_focus_element_;
   Event gamepad_event;
@@ -1337,9 +1328,11 @@ class InternalState : public Group {
   Event latest_event_;
   size_t latest_event_element_idx_;
 
+  std::function<void(HashedId id, Event event)> global_listener_;
+
   // Intra-frame persistent state.
   static struct PersistentState {
-    PersistentState() : is_last_event_pointer_type(true) {
+    PersistentState() : is_last_event_pointer_type(true), initialized(false) {
       // This is effectively a global, so no memory allocation or other
       // complex initialization here.
       for (int i = 0; i < InputSystem::kMaxSimultanuousPointers; i++) {
@@ -1370,8 +1363,14 @@ class InternalState : public Group {
     vec2i drag_start_position_;
     int32_t dragging_pointer_;
 
-    // If yes, then touch/mouse, else gamepad/keyboard.
+    // If true, then touch/mouse, else gamepad/keyboard.
     bool is_last_event_pointer_type;
+
+    // If true, then InternalState has been initialized.
+    bool initialized;
+
+    // HashMap for storing animations.
+    std::unordered_map<std::string, Anim> animations;
   } persistent_;
 
   const FlatUiVersion *version_;
@@ -1384,10 +1383,14 @@ class InternalState : public Group {
 InternalState::PersistentState InternalState::persistent_;
 
 void Run(fplbase::AssetManager &assetman, FontManager &fontman,
-         fplbase::InputSystem &input,
+         fplbase::InputSystem &input, motive::MotiveEngine *motive_engine,
          const std::function<void()> &gui_definition) {
   // Create our new temporary state.
-  InternalState internal_state(assetman, fontman, input);
+  InternalState internal_state(assetman, fontman, input, motive_engine);
+
+  // run through persistent_.animations, removing animation that has
+  // called_last_frame as false and set all "called_last_frame" to be false
+  state->Clean();
 
   // Run two passes, one for layout, one for rendering.
   // First pass:
@@ -1398,11 +1401,17 @@ void Run(fplbase::AssetManager &assetman, FontManager &fontman,
 
   auto &renderer = assetman.renderer();
   renderer.SetBlendMode(fplbase::kBlendModeAlpha);
-  renderer.DepthTest(false);
+  renderer.DepthTest(internal_state.depth_test());
 
   gui_definition();
 
   internal_state.CheckGamePadFocus();
+}
+
+void Run(fplbase::AssetManager &assetman, FontManager &fontman,
+         fplbase::InputSystem &input,
+         const std::function<void()> &gui_definition) {
+  Run(assetman, fontman, input, NULL, gui_definition);
 }
 
 InternalState *Gui() {
@@ -1412,15 +1421,28 @@ InternalState *Gui() {
 
 void Image(const Texture &texture, float size) { Gui()->Image(texture, size); }
 
-void Label(const char *text, float font_size) { Gui()->Label(text, font_size); }
-
-void Label(const char *text, float font_size, const vec2 &size) {
-  Gui()->Label(text, font_size, size);
+void Label(const char *text, float font_size) {
+  auto size = vec2(0, font_size);
+  Gui()->Label(text, font_size, size, kTextAlignmentLeft);
 }
 
-bool Edit(float ysize, const mathfu::vec2 &size, const char *id,
-          std::string *string) {
-  return Gui()->Edit(ysize, size, id, string);
+void Label(const char *text, float font_size, const vec2 &size) {
+  Gui()->Label(text, font_size, size, kTextAlignmentLeft);
+}
+
+void Label(const char *text, float font_size, const vec2 &size,
+           TextAlignment alignment) {
+  Gui()->Label(text, font_size, size, alignment);
+}
+
+Event Edit(float ysize, const mathfu::vec2 &size, const char *id,
+           EditStatus *status, std::string *string) {
+  return Gui()->Edit(ysize, size, kTextAlignmentLeft, id, status, string);
+}
+
+Event Edit(float ysize, const mathfu::vec2 &size, TextAlignment alignment,
+           const char *id, EditStatus *status, std::string *string) {
+  return Gui()->Edit(ysize, size, alignment, id, status, string);
 }
 
 void StartGroup(Layout layout, float spacing, const char *id) {
@@ -1447,7 +1469,7 @@ void EndSlider() { Gui()->EndSlider(); }
 void CustomElement(
     const vec2 &virtual_size, const char *id,
     const std::function<void(const vec2i &pos, const vec2i &size)> renderer) {
-  Gui()->CustomElement(virtual_size, id, renderer);
+  Gui()->Element(virtual_size, id, renderer);
 }
 
 void RenderTexture(const Texture &tex, const vec2i &pos, const vec2i &size) {
@@ -1464,9 +1486,38 @@ void RenderTextureNinePatch(const Texture &tex, const vec4 &patch_info,
   Gui()->RenderTextureNinePatch(tex, patch_info, pos, size);
 }
 
+void EnableTextSDF(bool inner_sdf, bool outer_sdf, float threshold) {
+  Gui()->EnableTextSDF(inner_sdf, outer_sdf, threshold);
+}
+
+void SetTextOuterColor(const mathfu::vec4 &color, float size,
+                       const mathfu::vec2 &offset) {
+  Gui()->SetTextOuterColor(color, size, offset);
+}
+
 void SetTextColor(const mathfu::vec4 &color) { Gui()->SetTextColor(color); }
 
-void SetTextFont(const char *font_name) { Gui()->SetTextFont(font_name); }
+bool SetTextFont(const char *font_name) {
+  return Gui()->SetTextFont(font_name);
+}
+bool SetTextFont(const char *font_names[], int32_t count) {
+  return Gui()->SetTextFont(font_names, count);
+}
+
+void SetTextLocale(const char *locale) { Gui()->SetTextLocale(locale); }
+void SetTextDirection(const TextLayoutDirection direction) {
+  Gui()->SetTextDirection(direction);
+}
+
+void SetTextLineHeightScale(float scale) {
+  Gui()->SetTextLineHeightScale(scale);
+}
+
+void SetTextKerningScale(float scale) { Gui()->SetTextKerningScale(scale); }
+
+void SetTextEllipsis(const char* ellipsis) {
+  Gui()->SetTextEllipsis(ellipsis);
+}
 
 Event CheckEvent() { return Gui()->CheckEvent(false); }
 Event CheckEvent(bool check_dragevent_only) {
@@ -1502,6 +1553,8 @@ void UseExistingProjection(const vec2i &canvas_size) {
   Gui()->UseExistingProjection(canvas_size);
 }
 
+void SetDepthTest(bool enable) { Gui()->SetDepthTest(enable); }
+
 mathfu::vec2i VirtualToPhysical(const mathfu::vec2 &v) {
   return Gui()->VirtualToPhysical(v);
 }
@@ -1535,6 +1588,29 @@ vec2 GroupSize() { return Gui()->PhysicalToVirtual(Gui()->GroupSize()); }
 
 bool IsLastEventPointerType() { return Gui()->IsLastEventPointerType(); }
 
+void ApplyCustomTransform(const mat4 &imvp) {
+  Gui()->ApplyCustomTransform(imvp);
+}
+
+void SetGlobalListener(
+    const std::function<void(HashedId id, Event event)> &callback) {
+  Gui()->SetGlobalListener(callback);
+}
+
 const FlatUiVersion *GetFlatUiVersion() { return Gui()->GetFlatUiVersion(); }
+
+namespace details {
+
+const float *Animatable(const std::string &id, const float *starting_values,
+                        int dimensions) {
+  return Gui()->Animatable(id, starting_values, dimensions);
+}
+
+void StartAnimation(const std::string &id, double target_time,
+                    const float *target_values, int dimensions) {
+  Gui()->StartAnimation(id, target_time, target_values, dimensions);
+}
+
+}  // namespace details
 
 }  // namespace flatui

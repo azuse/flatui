@@ -1,4 +1,4 @@
-# Copyright 2015 Google Inc. All rights reserved.
+# Copyright 2016 Google Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,10 +13,10 @@
 # limitations under the License.
 
 APP_PLATFORM := android-15
-APP_ABI:=armeabi armeabi-v7a-hard mips x86 x86_64
-APP_STL := gnustl_static
+APP_ABI:=armeabi armeabi-v7a mips x86 x86_64
+APP_STL:=c++_static
 APP_MODULES := main
-NDK_TOOLCHAIN_VERSION := 4.8
+
 APP_CPPFLAGS += -std=c++11 -Wno-literal-suffix
 
 

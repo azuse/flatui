@@ -29,7 +29,17 @@ typedef SSIZE_T ssize_t;
 #include "fplbase/input.h"
 #include "mathfu/constants.h"
 
+// Predeclarations.
+namespace motive {
+class MotiveEngine;
+}
+
 namespace flatui {
+
+// Maximum dimension of mathfu::Vector.
+static const int kMaxDimensions = 4;
+// Multiplier to convert a second to MotiveTime.
+static const int kSecondsToMotiveTime = 10000;
 
 /// @file
 /// @addtogroup flatui_core
@@ -46,9 +56,20 @@ namespace flatui {
 /// @param[in,out] assetman The AssetManager you want to use textures from.
 /// @param[in] fontman The FontManager to be used by the GUI.
 /// @param[in] input The InputSystem to be used by the GUI.
+/// @param[in] motive_engine A pointer to the MotiveEngine to be used by the GUI
+/// for animation purpose.
 /// @param[in] gui_definition A function that defines all GUI elements using the
 /// GUI element construction functions. (It will be run twice, once for the
 /// layout, and once for rendering & events.)
+void Run(fplbase::AssetManager &assetman, FontManager &fontman,
+         fplbase::InputSystem &input, motive::MotiveEngine *motive_engine,
+         const std::function<void()> &gui_definition);
+
+/// @brief A version of the function above that doesn't use a MotiveEngine.
+/// With this version of Run(), user will not be able to use the animation
+/// features of FlatUI.
+/// If a user tries to use FlatUI's animation features with this version of
+/// Run(), the program will terminate with an error.
 void Run(fplbase::AssetManager &assetman, FontManager &fontman,
          fplbase::InputSystem &input,
          const std::function<void()> &gui_definition);
@@ -160,6 +181,27 @@ enum Direction {
   kDirOverlay = 12
 };
 
+/// @enum EditStatus
+///
+/// @brief Status of Edit widget.
+///
+/// **Enumerations**:
+///
+/// * `kEditStatusNone`     - The widget is not editing.
+/// * `kEditStatusInEdit`   - The widget is in edit.
+/// * `kEditStatusUpdated`  - The widget is in edit and contents has been
+///                           updated in the current update cycle.
+/// * `kEditStatusFinished` - The widget finished editing with an updated
+///                           contents.
+/// * `kEditStatusCanceled` - The edit is canceled by the user pressing esc.
+enum EditStatus {
+  kEditStatusNone = 0,
+  kEditStatusInEdit = 1,
+  kEditStatusUpdated = 2,
+  kEditStatusFinished = 3,
+  kEditStatusCanceled = 4,
+};
+
 /// @enum Layout
 ///
 /// @brief Specify how to layout a group.
@@ -216,7 +258,7 @@ enum Layout {
 /// @var kDefaultGroupID
 ///
 /// @brief A sentinel value for group IDs.
-const char* const kDefaultGroupID = "__group_id__";
+const char *const kDefaultGroupID = "__group_id__";
 
 /// @struct Margin
 ///
@@ -304,17 +346,115 @@ void Label(const char *text, float ysize);
 /// the label in this case.
 void Label(const char *text, float ysize, const mathfu::vec2 &size);
 
+/// @brief Render a multi-line label with a text alignment.
+///
+/// @param[in] text A C-string in UTF-8 format to be displayed as the label.
+/// @param[in] ysize A float containing the vertical size in virtual resolution.
+/// @param[in] alignment A text alignment in the label.
+/// @param[in] size The max size of the label in virtual resolution. A `0` for
+/// `size.y` indicates no height restriction. The API renders the whole text in
+/// the label in this case.
+void Label(const char *text, float ysize, const mathfu::vec2 &label_size,
+           TextAlignment alignment);
+
 /// @brief Set the Label's text color.
 ///
 /// @param[in] color A vec4 representing the RGBA values that the text color
 /// should be set to.
 void SetTextColor(const mathfu::vec4 &color);
 
+/// @brief Set the Label's outer color (e.g. drop shadow color).
+/// To use the feature, outer SDF generation needs to be enabled by
+/// EnableTextSDF() API. With SDF, each glyph image includes a distance to the
+/// nearest edge. The API utilizes the feature to render an outer region of a
+/// glyph.
+/// For more details of SDF, refer a paper from Valve:
+/// http://www.valvesoftware.com/publications/2007/SIGGRAPH2007_AlphaTestedMagnification.pdf
+///
+/// @param[in] color A vec4 representing the RGBA values that the outer color
+/// should be set to.
+/// @param[in] size A float value that changes the size of outer color region in
+/// pixels.
+/// Typical value range is around 64.0f/255.0f but varies by font
+/// face. As the value get bigger, the shadow region gets spread out.
+/// @param[in] offset A vec2 value that controls a position of the outer color
+/// region in pixels.
+void SetTextOuterColor(const mathfu::vec4 &color, float size,
+                       const mathfu::vec2 &offset);
+
+/// @brief Enable/Disable a signed distance field generation with glyphs.
+/// A SDF generation of an inner region and an outer region is done separately
+/// and it costs some cycles. So if an application doesn't utilize inner SDF,
+/// just enable outer SDF.
+///
+/// @param[in] inner_sdf set true to enable a distance field generation for an
+/// inner region of a glyph. false to disable it.
+/// @param[in] outer_sdf set true to enable a distance field generation for an
+/// outer region of a glyph. false to disable it.
+/// @param[in] threshold Threshold value used in the SDF glyph rendering.
+/// The value controls a threshold if a pixel nearby a glyph edge is considered
+/// inside a glyph or not.
+/// Typical value range is around 8.0f/255.0f ~ 24.0f/255f and it varies by font
+/// face. As the speficied value get bigger, rendered glyph images become bold.
+/// Default value is 16.0f/255.0f.
+void EnableTextSDF(bool inner_sdf, bool outer_sdf, float threshold);
+
 /// @brief Set the Label's font.
 ///
 /// @param[in] font_name A C-string corresponding to the name of the font
 /// that should be set.
-void SetTextFont(const char *font_name);
+///
+/// @return Returns `true` if the font file is succeffully opened.
+bool SetTextFont(const char *font_name);
+
+/// @brief Set the Label's fonts with a fallback priority.
+/// When rendering a text, if a glyph is not found in the first font in the
+/// array,
+/// the renderer will look up the glyph in the second font and so on.
+/// If the glyph is not found in all font files, the glyph won't be rendered on
+/// the screen.
+///
+/// @param[in] font_names An array of C-string corresponding to the name of the
+/// font. Font names in the array are stored in a priority order.
+/// @param[in] count A count of font names in the array.
+///
+/// @return Returns `true` if the font files are succeffully opened.
+bool SetTextFont(const char *font_names[], int32_t count);
+
+/// @brief Set a locale used for the text rendering.
+///
+/// @param[in] locale A C-string corresponding to the of the
+/// language defined in ISO 639 and country code defined in ISO 3166 connected
+/// by '-'. (e.g. 'en-US').
+/// The API sets language, script and layout direction used for following text
+/// renderings.
+void SetTextLocale(const char *locale);
+
+/// @brief Override a text layout direction set by SetTextLocale() API.
+///
+/// @param[in] direction TextLayoutDirection specifying text layout direction.
+void SetTextDirection(const TextLayoutDirection direction);
+
+/// @brief Set a line height scale used in the text rendering.
+///
+/// @param[in] scale A line height value. The value is multiplied to the font
+/// height and determines a space between lines.
+/// The default value is kLineHeightDefault(1.2f).
+void SetTextLineHeightScale(float scale);
+
+/// @brief Set a kerning scale used in the text rendering.
+///
+/// @param[in] scale A kerning scale value applied kerning values.
+/// The default value is kKerningScale(1.0f).
+void SetTextKerningScale(float scale);
+
+/// @brief Set an ellipsis string used in label/edit widgets.
+///
+/// @param[in] ellipsis A C-string specifying characters used as an ellipsis.
+/// Can be multiple characters, typically '...'. When a string in a widget
+/// doesn't fit to the given size, the string is truncated to fit the ellipsis
+/// string appended at the end.
+void SetTextEllipsis(const char *ellipsis);
 
 /// @brief Renders an edit text box as a GUI element.
 ///
@@ -323,12 +463,31 @@ void SetTextFont(const char *font_name);
 /// virtual resolution. A `0` for `size.x` indicates an auto expanding text box.
 /// A `0` for `size.y` indicates a single line label.
 /// @param[in] id A C-string in UTF-8 format to uniquely idenitfy this edit box.
-/// @param[in] string A pointer to a C-string in UTF-8 format that should
+/// @param[in/out] status A pointer to a EditStatus that indicates the status of
+/// Edit widget. Can be nullptr if the caller doesn't require the information.
+/// @param[in/out] string A pointer to a C-string in UTF-8 format that should
 /// be used as the Label for the edit box.
 ///
-/// @return Returns `true` if the widget is in edit.
-bool Edit(float ysize, const mathfu::vec2 &size, const char *id,
-          std::string *string);
+/// @return Returns the Event type for the Edit widget.
+Event Edit(float ysize, const mathfu::vec2 &size, const char *id,
+           EditStatus *status, std::string *string);
+
+/// @brief Render an edit text box with a text alignment.
+///
+/// @param[in] ysize A float containing the vertical size in virtual resolution.
+/// @param[in] size A mathfu::vec2 reference to the size of the edit box in
+/// virtual resolution. A `0` for `size.x` indicates an auto expanding text box.
+/// A `0` for `size.y` indicates a single line label.
+/// @param[in] alignment An alignment of the text in the edit box.
+/// @param[in] id A C-string in UTF-8 format to uniquely idenitfy this edit box.
+/// @param[in/out] status A pointer to a EditStatus that indicates the status of
+/// Edit widget. Can be nullptr if the caller doesn't require the information.
+/// @param[in/out] string A pointer to a C-string in UTF-8 format that should
+/// be used as the Label for the edit box.
+///
+/// @return Returns the Event type for the Edit widget.
+Event Edit(float ysize, const mathfu::vec2 &size, TextAlignment alignment,
+           const char *id, EditStatus *status, std::string *string);
 
 /// @brief Create a group of elements with a given layout and intra-element
 /// spacing.
@@ -548,8 +707,8 @@ void EndSlider();
 /// to render the element.
 void CustomElement(
     const mathfu::vec2 &virtual_size, const char *id,
-    const std::function<void(const mathfu::vec2i &pos,
-                             const mathfu::vec2i &size)> renderer);
+    const std::function<
+        void(const mathfu::vec2i &pos, const mathfu::vec2i &size)> renderer);
 
 /// @brief Render a Texture to a specific position with a given size.
 ///
@@ -652,6 +811,20 @@ void PositionGroup(Alignment horizontal, Alignment vertical,
 /// inside of.
 void UseExistingProjection(const mathfu::vec2i &canvas_size);
 
+/// @brief If you're rendering the UI at a location that does not correspond
+/// to the display's pixels (e.g. in 3D), this call allows you to set your
+/// a custom transform that corresponds to the inverse of your model-view-
+/// projection matrix. FlatUI will then transform all incoming (screen-space)
+/// pointer events with this, such that they are mapped to coordinates that
+/// match what was passed to UseExistingProjection.
+/// Important that the UI was rendered with object space coordinates ranging
+/// from (0,0) to canvas_size as well.
+/// Call this at the start of your UI.
+/// For an example of how to use this, see flatuisample_3d.cpp
+///
+/// @param[in] imvp The inverse model-view-projection matrix.
+void ApplyCustomTransform(const mathfu::mat4 &imvp);
+
 /// @return Returns the position of the current group in virtual coordinates.
 ///
 /// This is the top/left location of the group. When used in conjunction with
@@ -668,8 +841,121 @@ mathfu::vec2 GroupSize();
 bool IsLastEventPointerType();
 /// @}
 
+/// @brief Set a global listener callback that receives all events to all
+/// interactive elements (useful for logging/debugging/analytics etc, NOT
+/// intended for normal event handling).
+/// Does not affect events in the rest of the API.
+/// Gets called for all events except None, you must do your own filtering.
+/// Call this function as the first thing inside of Run().
+/// Callback never fires outside of Run().
+/// Use HashId() to compare against ids of elements you may be interested in.
+void SetGlobalListener(
+    const std::function<void(HashedId id, Event event)> &callback);
+
 // Returns the version of the FlatUI Library.
-const FlatUiVersion* GetFlatUiVersion();
+const FlatUiVersion *GetFlatUiVersion();
+
+/// @brief Enables depth testing, when needed for rendering a UI in 3D.
+///
+/// For example, a simple `FlatUI::Label()` could be rendered, with appropriate
+/// depth, on entities in the world to display the game's score as an overlay.
+///
+/// @warning This approach only works for 'simple' UIs, because more complex UIs
+/// require overlapping UI elements. Depending on the precision of the z-buffer,
+/// elements will be susceptible to z-fighting. That is, when the rectangles
+/// around UI elements overlap, flickering will occur.
+void SetDepthTest(bool enable);
+
+namespace details {
+
+/// @class FloatConverter
+///
+/// @brief converts from a mathfu::vector to a const float pointer and vice
+/// versa.
+template <typename T>
+class FloatConverter {
+ public:
+  static const float *ToFloatArray(const T &data);
+  static T FromFloatArray(const float *floats);
+  static int Dimension();
+};
+
+template <>
+class FloatConverter<float> {
+ public:
+  static const float *ToFloatArray(const float &data) { return &data; }
+  static float FromFloatArray(const float *floats) { return *floats; }
+  static int Dimension() { return 1; }
+};
+
+template <int d>
+class FloatConverter<mathfu::Vector<float, d>> {
+ public:
+  typedef mathfu::Vector<float, d> Vec;
+  static const float *ToFloatArray(const Vec &data) { return &data[0]; }
+  static Vec FromFloatArray(const float *floats) { return Vec(floats); }
+  static int Dimension() { return d; }
+};
+
+/// @brief This function is called by T Animatable() with its templated
+/// variables represented by float pointers instead. The User will call
+/// the templated version of Animatable().
+///
+/// @param[in] id A string that uniquely identifies a motivator
+/// @param[in] starting_value A float pointer to a mathfu::vector
+/// @param[in] dimensions An int representing the number of dimensions of the
+/// mathfu::vector
+///
+/// @return Returns a float pointer to the value of the motivator.
+const float *Animatable(const std::string &id, const float *starting_values,
+                        int dimensions);
+
+/// @brief This function is called by Animation() with its templated variable
+/// represented by a float pointer instead. The user will call the templated
+/// version of StartAnimation().
+///
+/// @param[in] id A string that uniquely identifies a motivator
+/// @param[in] target_time The duration of the animation, in seconds
+/// @param[in] target_value A float pointer to a mathfu::vector
+/// @param[in] dimensions An int representing the number of dimensions of the
+/// mathfu::vector
+void StartAnimation(const std::string &id, double target_time,
+                    const float *target_values, int dimensions);
+
+}  // namespace details
+
+/// @return Returns a value of type T.
+///
+/// @brief This function creates a new Motivator if it doesn't already exist
+/// and returns the current value of it.
+///
+/// @warning This function only works if you have passed in a MotiveEngine
+/// to Run().
+///
+/// @param[in] id A string that uniquely identifies a motivator
+/// @param[in] starting_value A variable of type T that is used to initialze
+/// a motivator
+template <typename T>
+T Animatable(std::string id, T starting_value) {
+  const float *motion = details::Animatable(
+      id, details::FloatConverter<T>::ToFloatArray(starting_value),
+      details::FloatConverter<T>::Dimension());
+  return details::FloatConverter<T>::FromFloatArray(motion);
+}
+
+/// @brief This function sets the target value to which a Motivator, that
+/// is identified by id, animates.
+///
+/// @param[in] id A string that uniquely identifies a motivator
+/// @param[in] target_value A variable of type T that represents the final
+/// value of the motivator
+/// @param[in] target_time A double representing the duration of the animation
+template <typename T>
+void StartAnimation(std::string id, T target_value, double target_time) {
+  details::StartAnimation(
+      id, target_time, details::FloatConverter<T>::ToFloatArray(target_value),
+      details::FloatConverter<T>::Dimension());
+}
 
 }  // namespace flatui
 

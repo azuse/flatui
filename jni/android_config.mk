@@ -34,6 +34,8 @@ else
   PREBUILTS_ROOT:=$(FPL_ROOT)/../../../prebuilts
 endif
 
+FLATUI_GENERATED_OUTPUT_DIR := $(FLATUI_DIR)/gen/include
+
 # Location of the SDL library.
 DEPENDENCIES_SDL_DIR?=$(THIRD_PARTY_ROOT)/sdl
 # Location of the Flatbuffers library.
@@ -48,12 +50,16 @@ DEPENDENCIES_HARFBUZZ_DIR?=$(THIRD_PARTY_ROOT)/harfbuzz
 DEPENDENCIES_LIBUNIBREAK_DIR?=$(THIRD_PARTY_ROOT)/libunibreak
 # Location of the MathFu library.
 DEPENDENCIES_MATHFU_DIR?=$(FPL_ROOT)/mathfu
+# Location of the motive library.
+DEPENDENCIES_MOTIVE_DIR?=$(FPL_ROOT)/motive
 # Location of the fplbase library.
 DEPENDENCIES_FPLBASE_DIR?=$(FPL_ROOT)/fplbase
 # Location of the Cardboard java library (required for fplbase)
 DEPENDENCIES_CARDBOARD_DIR?=$(PREBUILTS_ROOT)/cardboard-java/CardboardSample
 # Location of the flatui library (for samples and tests).
 DEPENDENCIES_FLATUI_DIR?=$(FLATUI_DIR)
+# Location of the STB library.
+DEPENDENCIES_STB_DIR?=$(THIRD_PARTY_ROOT)/stb
 
 ifeq (,$(DETERMINED_DEPENDENCY_DIRS))
 DETERMINED_DEPENDENCY_DIRS:=1
